@@ -1,36 +1,49 @@
 import sys
-from PyQt5.QtCore import QUrl, QTimer
-from PyQt5.QtWidgets import QApplication, QMainWindow, QToolBar, QAction, QLineEdit, QWidget, QVBoxLayout, QLabel, QDialog
-from PyQt5.QtWidgets import QSizePolicy, QPushButton
+from PyQt5.QtCore import QUrl
+from PyQt5.QtWidgets import QApplication, QMainWindow, QToolBar, QAction, QLineEdit, QDialog, QVBoxLayout, QLabel, QMessageBox
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWebEngineWidgets import QWebEngineView
+
 import requests
 from bs4 import BeautifulSoup
+import nltk
+import pickle
+from nltk.corpus import stopwords
+import string
+from nltk.stem.porter import PorterStemmer
+
+nltk.download('punkt')
+
+ps = PorterStemmer()
 
 class Browser(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.browser = QWebEngineView()
-        self.browser.setUrl(QUrl("https://www.google.com"))
-
-        self.setCentralWidget(self.browser)
+        self.tabs = []
 
         self.create_toolbar()
+        self.add_tab()  # Open the initial tab
 
         self.showMaximized()
         self.setWindowTitle("Web Browser")
+
+        # Load the pickled models
+        self.cv = pickle.load(open('countvectorizer.pkl', 'rb'))
+        self.tfidf = pickle.load(open('vectorizer.pkl', 'rb'))
+        self.mnb = pickle.load(open('model.pkl', 'rb'))
 
     def create_toolbar(self):
         navbar = QToolBar()
         self.addToolBar(navbar)
 
         actions = [
-            ("Back", self.browser.back),
-            ("Forward", self.browser.forward),
-            ("Reload", self.browser.reload),
+            ("Back", self.navigate_back),
+            ("Forward", self.navigate_forward),
+            ("Reload", self.navigate_reload),
             ("Home", self.navigate_home),
-            ("Scrape", self.scrape_current_page)
+            ("Scrape", self.scrape_current_page),
+            ("New Tab", self.add_tab)
         ]
 
         for action_text, method in actions:
@@ -57,68 +70,130 @@ class Browser(QMainWindow):
         quit_action.triggered.connect(self.quit_application)
         navbar.addAction(quit_action)
 
-        # Add a button to manually trigger scraping
-        scrape_button = QPushButton("Scrape")
-        scrape_button.clicked.connect(self.scrape_current_page)
-        navbar.addWidget(scrape_button)
+    def navigate_back(self):
+        self.current_browser().back()
 
-        navbar.addSeparator()
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        navbar.addWidget(spacer)
+    def navigate_forward(self):
+        self.current_browser().forward()
+
+    def navigate_reload(self):
+        self.current_browser().reload()
 
     def navigate_home(self):
-        self.browser.setUrl(QUrl("https://www.google.com"))
+        self.current_browser().setUrl(QUrl("https://www.google.com"))
 
     def navigate_to_url(self):
         q = QUrl(self.url_bar.text())
         if q.scheme() == "":
             q.setScheme("http")
-        self.browser.setUrl(q)
+        self.current_browser().setUrl(q)
 
     def open_in_default_browser(self):
-        QDesktopServices.openUrl(self.browser.url())
+        QDesktopServices.openUrl(self.current_browser().url())
 
     def show_about_dialog(self):
-        self.show_info_dialog("About Web Browser", "Simple web browser using Python and PyQt5.")
+        QMessageBox.about(self, "About Web Browser", "Simple web browser using Python and PyQt5.")
 
     def quit_application(self):
         QApplication.quit()
 
+    def add_tab(self):
+        browser = QWebEngineView()
+        browser.setUrl(QUrl("https://www.google.com"))
+        self.tabs.append(browser)
+        self.setCentralWidget(browser)
+        self.url_bar.setText("")
+        browser.urlChanged.connect(lambda qurl, browser=browser: self.update_urlbar(qurl, browser))
+
+    def current_browser(self):
+        if self.tabs:
+            return self.tabs[-1]
+        else:
+            return None
+
+    def update_urlbar(self, q, browser=None):
+        if browser != self.current_browser():
+            return
+        self.url_bar.setText(q.toString())
+        self.url_bar.setCursorPosition(0)
+
     def scrape_current_page(self):
-        current_url = self.browser.url().toString()
+        current_url = self.current_browser().url().toString()
         if current_url:
             self.scrape_url(current_url)
+
+    def transform_text(self, text):
+        text = text.lower()
+        text = nltk.word_tokenize(text)
+
+        y = []
+        for i in text:
+            if i.isalnum():
+                y.append(i)
+
+        text = y[:]
+        y.clear()
+
+        for i in text:
+            if i not in stopwords.words('english') and i not in string.punctuation:
+                y.append(i)
+
+        text = y[:]
+        y.clear()
+
+        for i in text:
+            y.append(ps.stem(i))
+
+        return " ".join(y)
 
     def scrape_url(self, url):
         response = requests.get(url)
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
-            form = soup.find('form')
-
-            if form:
-                input_fields = form.find_all('input')
-
-                required_fields = []
-                non_required_fields = []
-
-                for input_field in input_fields:
-                    field_label = input_field.get('aria-label') or input_field.get('placeholder') or input_field.get('name')
-                    field_value = input_field.get('value')
-                    is_required = 'required' in input_field.attrs
-
-                    if is_required:
-                        required_fields.append((field_label, field_value))
-                    else:
-                        non_required_fields.append((field_label, field_value))
-
-                self.show_scrape_results(required_fields, non_required_fields)
-
-            else:
-                self.show_warning_dialog("Scraping Error", "No form found on the page.")
+            self.spam_check(soup)
+            self.form_check(soup)
 
         else:
-            self.show_warning_dialog("Scraping Error", f"Failed to fetch the webpage. Status code: {response.status_code}")
+            QMessageBox.warning(self, "Scraping Error", f"Failed to fetch the webpage. Status code: {response.status_code}")
+
+    def spam_check(self, soup):
+        try:
+            text_content = soup.get_text()
+            text = self.transform_text(text_content)
+            cv_input = self.cv.transform([text])
+            vector_input = self.tfidf.transform(cv_input)
+            result = self.mnb.predict(vector_input)[0]
+
+            if result == 1:
+                QMessageBox.warning(self, "Spam Check", "Potential spam detected on the webpage!")
+            else:
+                QMessageBox.information(self, "Spam Check", "No spam detected on the webpage.")
+        except Exception as e:
+            QMessageBox.warning(self, "Spam Check Error", f"Error during spam check: {str(e)}")
+
+    def form_check(self, soup):
+        form = soup.find('form')
+
+        if form:
+            input_fields = form.find_all('input')
+
+            required_fields = []
+            non_required_fields = []
+
+            for input_field in input_fields:
+                field_label = input_field.get('aria-label') or input_field.get('placeholder') or input_field.get('name')
+                field_value = input_field.get('value')
+                is_required = 'required' in input_field.attrs
+
+                if is_required:
+                    required_fields.append((field_label, field_value))
+                else:
+                    non_required_fields.append((field_label, field_value))
+
+            self.show_scrape_results(required_fields, non_required_fields)
+
+        else:
+            QMessageBox.warning(self, "Form Check", "No form found on the page.")
 
     def show_scrape_results(self, required_fields, non_required_fields):
         dialog = QDialog(self)
@@ -143,17 +218,11 @@ class Browser(QMainWindow):
         dialog.setLayout(layout)
         dialog.exec_()
 
-    def show_info_dialog(self, title, message):
-        QMessageBox.information(self, title, message)
-
-    def show_warning_dialog(self, title, message):
-        QMessageBox.warning(self, title, message)
-
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    QApplication.setApplicationName("Web Browser")
-    QApplication.setOrganizationName("YourOrganization")
-    QApplication.setOrganizationDomain("yourorganization.com")
+    QApplication.setApplicationName("SemiWeb")
+    QApplication.setOrganizationName("SemiColon")
+    QApplication.setOrganizationDomain("semicolon.com")
 
     window = Browser()
     sys.exit(app.exec_())
